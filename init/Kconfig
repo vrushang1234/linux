@@ -2168,3 +2168,9 @@ config ARCH_HAS_SYNC_CORE_BEFORE_USERMODE
 # <asm/syscall_wrapper.h>.
 config ARCH_HAS_SYSCALL_WRAPPER
 	def_bool n
+
+config SCHED_NN
+	bool "Neural-network scheduler"
+	default y
+	help	
+		Build kernel/sched/nn_policy.o and enbale it in the scheduler

@@ -57,6 +57,7 @@
 #include "sched.h"
 #include "stats.h"
 #include "autogroup.h"
+#include "rl.h"
 
 /*
  * The initial- and re-scaling of tunables is configurable
@@ -6923,6 +6924,16 @@ requeue_delayed_entity(struct sched_entity *se)
 	update_load_avg(cfs_rq, se, 0);
 	clear_delayed(se);
 }
+static inline q16_16 q_from_ns_clamped(s64 ns)
+{
+    /* Convert ns -> us to keep magnitudes in a comfy range */
+    s64 us = div_s64(ns, 1000);
+    /* Clamp to Q16.16 signed 32-bit range: [-32768, 32767] in integer part */
+    if (us >  0x7fff) us =  0x7fff;
+    if (us < -0x8000) us = -0x8000;
+    return (q16_16)(us << 16);  /* to Q16.16 */
+
+}
 
 /*
  * The enqueue_task method is called before nr_running is
@@ -6964,6 +6975,31 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 	if (task_new && se->sched_delayed)
 		h_nr_runnable = 0;
+
+  /* ---- RL observe-only tap (no enforcement) ---- */
+	cfs_rq = task_cfs_rq(p);
+
+	/* normalized vruntime relative to this cfs_rq */
+	s64 vdelta_ns = (s64)(se->vruntime - cfs_rq->min_vruntime);
+
+	/*
+	* 'deadline' is EEVDF’s virtual deadline (also in ns). It can be 0 if not
+	* initialized yet; treat non-positive as 0 for now.
+	*/
+	s64 d_ns = (s64)se->deadline - (s64)se->vruntime;
+	if (d_ns < 0)
+		d_ns = 0;
+
+	q16_16 s0 = q_from_ns_clamped(vdelta_ns);
+	q16_16 s1 = q_from_ns_clamped(d_ns);
+
+	/* Decide, but only print; do NOT apply nice yet */
+	int nn_nice_delta = rl_policy_decide(s0, s1);
+
+	/* Avoid spamming: use ratelimited debug */
+	pr_debug_ratelimited("rl: p=%d vdelta=%lldns d=%lldns -> nn_nice=%d\n",
+			p->pid, (long long)vdelta_ns, (long long)d_ns, nn_nice_delta);
+	/* ---------------------------------------------- */
 
 	for_each_sched_entity(se) {
 		if (se->on_rq) {

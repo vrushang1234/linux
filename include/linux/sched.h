@@ -587,6 +587,8 @@ struct sched_entity {
 	s64				vlag;
 	u64				slice;
 
+  u64 rl_sum_at_start;
+
 	u64				nr_migrations;
 
 #ifdef CONFIG_FAIR_GROUP_SCHED

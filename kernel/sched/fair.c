@@ -5573,6 +5573,7 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 				    se->sum_exec_runtime - se->prev_sum_exec_runtime));
 	}
 
+  se->rl_sum_at_start = se->sum_exec_runtime;
 	se->prev_sum_exec_runtime = se->sum_exec_runtime;
 }
 
@@ -9037,10 +9038,16 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev, struct t
 	struct sched_entity *se = &prev->se;
 	struct cfs_rq *cfs_rq;
 
+
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 		put_prev_entity(cfs_rq, se);
 	}
+  if (likely(prev->se.rl_sum_at_start)) {
+        u64 burst = prev->se.sum_exec_runtime - prev->se.rl_sum_at_start;
+        trace_printk("pid=%d last_burst=%lluns\n",
+                     prev->pid, (unsigned long long)burst);
+    }
 }
 
 /*

@@ -189,3 +189,11 @@ static inline void back_prop(const q16_16 *state, int action_idx, q16_16 reward_
     update_weights(W1, grad_z1, state, HIDDEN_LAYER_1_SIZE, INPUT_SIZE);
 }
 
+void nn_back_prop(const q16_16 *state, int action_idx, q16_16 reward_q)
+{
+    /* If rewards can be delayed (and activations stale), you MAY re-run:
+       forward_prop(state);
+       before backprop. For now we keep it minimal. */
+    back_prop(state, action_idx, reward_q);
+}
+

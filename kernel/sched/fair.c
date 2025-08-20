@@ -5321,6 +5321,7 @@ static void
 enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
 	bool curr = cfs_rq->curr == se;
+  struct rq *rq = rq_of(cfs_rq);
 
 	/*
 	 * If we're the current task, we must renormalise before calling
@@ -5364,6 +5365,10 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	check_schedstat_required();
 	update_stats_enqueue_fair(cfs_rq, se, flags);
+
+  if (!curr && !se->on_rq && !se->rl_wait_time_start)
+    se->rl_wait_time_start = rq_clock_task(rq);
+
 	if (!curr)
 		__enqueue_entity(cfs_rq, se);
 	se->on_rq = 1;
@@ -5381,6 +5386,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 			if (!cfs_rq->throttled_clock_self)
 				cfs_rq->throttled_clock_self = rq_clock(rq);
 #endif
+    
 		}
 	}
 }
@@ -5553,7 +5559,18 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 
 		set_protect_slice(se);
 	}
+  if (se->rl_wait_time_start) {
+    struct rq *rq = rq_of(cfs_rq);
+    u64 now = rq_clock_task(rq);
+    u64 wait_ns = now - se->rl_wait_time_start;
 
+    se->rl_wait_time_start = 0;
+    se->rl_last_wait_time = wait_ns;
+
+    struct task_struct *p = task_of(se);
+    trace_printk("PID:%d Wait Time:%llu ns\n", p->pid,
+                 (unsigned long long)se->rl_last_wait_time);
+  }
 	update_stats_curr_start(cfs_rq, se);
 	WARN_ON_ONCE(cfs_rq->curr);
 	cfs_rq->curr = se;

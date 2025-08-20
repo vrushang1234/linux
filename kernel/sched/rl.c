@@ -1,5 +1,9 @@
 #include "rl.h"
 
+
+#define Q      16
+#define ONE_Q  ((q16_16)1 << Q)
+
 static const s8 nn_nice_values[OUTPUT_SIZE] = { -5,-4,-3,-2,-1,0,1,2,3,4,5 };
 
 static inline q16_16 q_mul(q16_16 a, q16_16 b) { return (q16_16)(((s64)a * (s64)b) >> Q); }

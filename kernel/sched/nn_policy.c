@@ -1,6 +1,11 @@
 #include "rl.h"            /* q16_16, INPUT_SIZE, OUTPUT_SIZE, nn_output */
 #include <linux/types.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/spinlock.h>
+#include <linux/init.h>
 
+static DEFINE_RAW_SPINLOCK(rl_lock);
 /* Q16.16 fixed-point */
 #define Q      16
 #define ONE_Q  ((q16_16)1 << Q)
@@ -191,9 +196,104 @@ static inline void back_prop(const q16_16 *state, int action_idx, q16_16 reward_
 
 void nn_back_prop(const q16_16 *state, int action_idx, q16_16 reward_q)
 {
-    /* If rewards can be delayed (and activations stale), you MAY re-run:
-       forward_prop(state);
-       before backprop. For now we keep it minimal. */
+    unsigned long flags;
+    raw_spin_lock_irqsave(&rl_lock, flags);
     back_prop(state, action_idx, reward_q);
+    raw_spin_unlock_irqrestore(&rl_lock, flags);
 }
+
+static inline void q16_16_print(struct seq_file *m, q16_16 q)
+{
+    bool neg = q < 0;
+    u32 uq = neg ? (u32)(-q) : (u32)q;
+    u32 ip = uq >> 16;
+    u32 fp = ((uq & 0xFFFF) * 10000u) >> 16;  /* 4 decimal places */
+    seq_printf(m, "%s%u.%04u", neg ? "-" : "", ip, fp);
+}
+
+static int show_W1(struct seq_file *m, void *v)
+{
+    unsigned long f; raw_spin_lock_irqsave(&rl_lock, f);
+    for (unsigned r = 0; r < HIDDEN_LAYER_1_SIZE; r++) {
+        for (unsigned c = 0; c < INPUT_SIZE; c++) {
+            q16_16_print(m, W1[r * INPUT_SIZE + c]);
+            if (c + 1 != INPUT_SIZE) seq_putc(m, ' ');
+        }
+        seq_putc(m, '\n');
+    }
+    raw_spin_unlock_irqrestore(&rl_lock, f);
+    return 0;
+}
+
+static int show_B1(struct seq_file *m, void *v)
+{
+    unsigned long f; raw_spin_lock_irqsave(&rl_lock, f);
+    for (unsigned h = 0; h < HIDDEN_LAYER_1_SIZE; h++) {
+        q16_16_print(m, B1[h]);
+        if (h + 1 != HIDDEN_LAYER_1_SIZE) seq_putc(m, ' ');
+    }
+    seq_putc(m, '\n');
+    raw_spin_unlock_irqrestore(&rl_lock, f);
+    return 0;
+}
+
+static int show_W2(struct seq_file *m, void *v)
+{
+    unsigned long f; raw_spin_lock_irqsave(&rl_lock, f);
+    for (unsigned o = 0; o < OUTPUT_SIZE; o++) {
+        for (unsigned h = 0; h < HIDDEN_LAYER_1_SIZE; h++) {
+            q16_16_print(m, W2[o * HIDDEN_LAYER_1_SIZE + h]);
+            if (h + 1 != HIDDEN_LAYER_1_SIZE) seq_putc(m, ' ');
+        }
+        seq_putc(m, '\n');
+    }
+    raw_spin_unlock_irqrestore(&rl_lock, f);
+    return 0;
+}
+
+static int show_B2(struct seq_file *m, void *v)
+{
+    unsigned long f; raw_spin_lock_irqsave(&rl_lock, f);
+    for (unsigned o = 0; o < OUTPUT_SIZE; o++) {
+        q16_16_print(m, B2[o]);
+        if (o + 1 != OUTPUT_SIZE) seq_putc(m, ' ');
+    }
+    seq_putc(m, '\n');
+    raw_spin_unlock_irqrestore(&rl_lock, f);
+    return 0;
+}
+
+static int open_W1(struct inode *inode, struct file *file){ return single_open(file, show_W1, NULL); }
+static int open_B1(struct inode *inode, struct file *file){ return single_open(file, show_B1, NULL); }
+static int open_W2(struct inode *inode, struct file *file){ return single_open(file, show_W2, NULL); }
+static int open_B2(struct inode *inode, struct file *file){ return single_open(file, show_B2, NULL); }
+
+static const struct proc_ops W1_ops = {
+    .proc_open = open_W1, .proc_read = seq_read, .proc_lseek = seq_lseek, .proc_release = single_release
+};
+static const struct proc_ops B1_ops = {
+    .proc_open = open_B1, .proc_read = seq_read, .proc_lseek = seq_lseek, .proc_release = single_release
+};
+static const struct proc_ops W2_ops = {
+    .proc_open = open_W2, .proc_read = seq_read, .proc_lseek = seq_lseek, .proc_release = single_release
+};
+static const struct proc_ops B2_ops = {
+    .proc_open = open_B2, .proc_read = seq_read, .proc_lseek = seq_lseek, .proc_release = single_release
+};
+
+#define PROC_DIR "sched_rl"
+
+static int __init sched_rl_proc_init(void)
+{
+    struct proc_dir_entry *dir = proc_mkdir(PROC_DIR, NULL);
+    if (!dir) return -ENOMEM;
+
+    if (!proc_create("W1", 0444, dir, &W1_ops)) return -ENOMEM;
+    if (!proc_create("B1", 0444, dir, &B1_ops)) return -ENOMEM;
+    if (!proc_create("W2", 0444, dir, &W2_ops)) return -ENOMEM;
+    if (!proc_create("B2", 0444, dir, &B2_ops)) return -ENOMEM;
+
+    return 0;
+}
+late_initcall(sched_rl_proc_init);
 

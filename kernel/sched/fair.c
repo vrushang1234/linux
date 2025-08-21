@@ -21,6 +21,7 @@
  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra
  */
 #include <linux/energy_model.h>
+#include <linux/limits.h>
 #include <linux/mmap_lock.h>
 #include <linux/hugetlb_inline.h>
 #include <linux/jiffies.h>
@@ -5366,8 +5367,19 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	check_schedstat_required();
 	update_stats_enqueue_fair(cfs_rq, se, flags);
 
-  	if (!curr && !se->rl_wait_time_start)
-    		se->rl_wait_time_start = rq_clock_task(rq);
+  if (!curr && !se->rl_wait_time_start)
+    se->rl_wait_time_start = rq_clock_task(rq);
+
+  if (unlikely(!se->rl_inited)) {
+    se->rl_action = rl_policy_decide(0, 0);   /* first decision on zeros */
+
+    se->rl_sum_at_start    = se->sum_exec_runtime;
+    se->rl_last_wait_time  = 0;
+    se->rl_burst           = 0;
+    se->rl_wait_time_start = 0;
+    se->rl_inited          = 1;
+}
+
 
 	if (!curr)
 		__enqueue_entity(cfs_rq, se);
@@ -5505,6 +5517,8 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	update_load_avg(cfs_rq, se, action);
 	se_update_runnable(se);
 
+  se->rl_wait_time_start = 0;
+
 	update_stats_dequeue_fair(cfs_rq, se, flags);
 
 	update_entity_lag(cfs_rq, se);
@@ -5565,10 +5579,6 @@ if (se->rl_wait_time_start) {
 
     se->rl_wait_time_start = 0;
     se->rl_last_wait_time = wait_ns;
-
-    struct task_struct *p = task_of(se);
-    trace_printk("PID:%d Wait Time:%llu ns\n", p->pid,
-                 (unsigned long long)se->rl_last_wait_time);
   }
 
 	}
@@ -5632,6 +5642,34 @@ pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq)
 
 static bool check_cfs_rq_runtime(struct cfs_rq *cfs_rq);
 
+static inline void apply_action_nice(struct cfs_rq *cfs_rq,
+                                     struct sched_entity *se,
+                                     int new_nice)
+{
+    struct task_struct *p = task_of(se);
+
+    if (unlikely(p->sched_class != &fair_sched_class))
+        return; /* ignore non-CFS */
+
+    new_nice = clamp(new_nice, MIN_NICE, MAX_NICE);
+    if (task_nice(p) == new_nice)
+        return; 
+
+    /* 1) Update prio fields for this CFS task */
+    p->static_prio = NICE_TO_PRIO(new_nice);
+    p->prio        = p->static_prio;   /* ok for SCHED_NORMAL */
+
+    /*
+     * 2) Recompute se->load.weight (uclamp-aware) WITHOUT touching rq totals.
+     *    Then apply it to the cfs_rq with reweight_entity().
+     */
+    set_load_weight(p, false);                 /* updates se->load.weight */
+    reweight_entity(cfs_rq, se, se->load.weight);
+
+    /* 3) EEVDF: refresh deadline so placement/reinsert uses new params */
+    update_deadline(cfs_rq, se);
+}
+
 static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
 {
 	/*
@@ -5644,18 +5682,24 @@ static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
 	/* throttle cfs_rqs exceeding runtime */
 	check_cfs_rq_runtime(cfs_rq);
 
-	if(!prev->rl_wait_time_start){
-		struct rq *rq = rq_of(cfs_rq);
-		prev->rl_wait_time_start = rq_clock_task(rq);
-	}
+	  rl_policy_reward(prev->rl_burst,prev->rl_last_wait_time,prev->rl_action, prev->rl_last_wait_time, prev->rl_burst,prev->vruntime);
+  prev->rl_action = rl_policy_decide(prev->rl_burst,prev->rl_last_wait_time);
+  apply_action_nice(cfs_rq, prev, prev->rl_action);
+
 
 	if (prev->on_rq) {
+    if(!prev->rl_wait_time_start){
+		  struct rq *rq = rq_of(cfs_rq);
+		  prev->rl_wait_time_start = rq_clock_task(rq);
+	  } 
 		update_stats_wait_start_fair(cfs_rq, prev);
 		/* Put 'current' back into the tree. */
 		__enqueue_entity(cfs_rq, prev);
 		/* in !on_rq case, update occurred at dequeue */
 		update_load_avg(cfs_rq, prev, 0);
-	}
+	} else {
+    prev->rl_wait_time_start = 0;
+  }
 	WARN_ON_ONCE(cfs_rq->curr != prev);
 	cfs_rq->curr = NULL;
 }
@@ -7000,30 +7044,6 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (task_new && se->sched_delayed)
 		h_nr_runnable = 0;
 
-  /* ---- RL observe-only tap (no enforcement) ---- */
-	cfs_rq = task_cfs_rq(p);
-
-	/* normalized vruntime relative to this cfs_rq */
-	s64 vdelta_ns = (s64)(se->vruntime - cfs_rq->min_vruntime);
-
-	/*
-	* 'deadline' is EEVDF’s virtual deadline (also in ns). It can be 0 if not
-	* initialized yet; treat non-positive as 0 for now.
-	*/
-	s64 d_ns = (s64)se->deadline - (s64)se->vruntime;
-	if (d_ns < 0)
-		d_ns = 0;
-
-	q16_16 s0 = q_from_ns_clamped(vdelta_ns);
-	q16_16 s1 = q_from_ns_clamped(d_ns);
-
-	/* Decide, but only print; do NOT apply nice yet */
-	int nn_nice_delta = rl_policy_decide(s0, s1);
-
-	/* Avoid spamming: use ratelimited debug */
-	pr_debug_ratelimited("rl: p=%d vdelta=%lldns d=%lldns -> nn_nice=%d\n",
-			p->pid, (long long)vdelta_ns, (long long)d_ns, nn_nice_delta);
-	/* ---------------------------------------------- */
 
 	for_each_sched_entity(se) {
 		if (se->on_rq) {
@@ -9060,16 +9080,17 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev, struct t
 {
 	struct sched_entity *se = &prev->se;
 	struct cfs_rq *cfs_rq;
-
+  
+  if (likely(prev->se.rl_sum_at_start)) {
+        u64 burst = prev->se.sum_exec_runtime - prev->se.rl_sum_at_start;
+        se->rl_burst = burst;
+  }
 
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 		put_prev_entity(cfs_rq, se);
 	}
-  if (likely(prev->se.rl_sum_at_start)) {
-        u64 burst = prev->se.sum_exec_runtime - prev->se.rl_sum_at_start;
-	burst++;
-    }
+  
 }
 
 /*

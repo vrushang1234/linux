@@ -4782,7 +4782,13 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	}
 
 	init_entity_runnable_average(&p->se);
-
+p->se.rl_sum_at_start     = 0;
+p->se.rl_burst            = 0;
+p->se.rl_wait_time_start  = 0;
+p->se.rl_wait_time_end    = 0;
+p->se.rl_last_wait_time   = 0;
+p->se.rl_action           = 0;   
+p->se.rl_inited           = 0;  
 
 #ifdef CONFIG_SCHED_INFO
 	if (likely(sched_info_on()))

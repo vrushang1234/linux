@@ -5366,8 +5366,8 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	check_schedstat_required();
 	update_stats_enqueue_fair(cfs_rq, se, flags);
 
-  if (!curr && !se->on_rq && !se->rl_wait_time_start)
-    se->rl_wait_time_start = rq_clock_task(rq);
+  	if (!curr && !se->rl_wait_time_start)
+    		se->rl_wait_time_start = rq_clock_task(rq);
 
 	if (!curr)
 		__enqueue_entity(cfs_rq, se);
@@ -5546,7 +5546,7 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	clear_buddies(cfs_rq, se);
 
-	/* 'current' is not kept within the tree. */
+	 
 	if (se->on_rq) {
 		/*
 		 * Any task has to be enqueued before it get to execute on
@@ -5558,8 +5558,7 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 		update_load_avg(cfs_rq, se, UPDATE_TG);
 
 		set_protect_slice(se);
-	}
-  if (se->rl_wait_time_start) {
+if (se->rl_wait_time_start) {
     struct rq *rq = rq_of(cfs_rq);
     u64 now = rq_clock_task(rq);
     u64 wait_ns = now - se->rl_wait_time_start;
@@ -5571,7 +5570,9 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
     trace_printk("PID:%d Wait Time:%llu ns\n", p->pid,
                  (unsigned long long)se->rl_last_wait_time);
   }
-	update_stats_curr_start(cfs_rq, se);
+
+	}
+  	update_stats_curr_start(cfs_rq, se);
 	WARN_ON_ONCE(cfs_rq->curr);
 	cfs_rq->curr = se;
 
@@ -5642,6 +5643,11 @@ static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
 
 	/* throttle cfs_rqs exceeding runtime */
 	check_cfs_rq_runtime(cfs_rq);
+
+	if(!prev->rl_wait_time_start){
+		struct rq *rq = rq_of(cfs_rq);
+		prev->rl_wait_time_start = rq_clock_task(rq);
+	}
 
 	if (prev->on_rq) {
 		update_stats_wait_start_fair(cfs_rq, prev);
@@ -9062,8 +9068,7 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev, struct t
 	}
   if (likely(prev->se.rl_sum_at_start)) {
         u64 burst = prev->se.sum_exec_runtime - prev->se.rl_sum_at_start;
-        trace_printk("pid=%d last_burst=%lluns\n",
-                     prev->pid, (unsigned long long)burst);
+	burst++;
     }
 }
 

@@ -21,7 +21,6 @@
  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra
  */
 #include <linux/energy_model.h>
-#include <linux/limits.h>
 #include <linux/mmap_lock.h>
 #include <linux/hugetlb_inline.h>
 #include <linux/jiffies.h>
@@ -58,7 +57,9 @@
 #include "sched.h"
 #include "stats.h"
 #include "autogroup.h"
-#include "rl.h"
+#include "nn_policy.h"
+
+
 
 /*
  * The initial- and re-scaling of tunables is configurable
@@ -851,6 +852,9 @@ RB_DECLARE_CALLBACKS(static, min_vruntime_cb, struct sched_entity,
  */
 static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
+  struct rq *rq = rq_of(cfs_rq);
+  se->rl_wait_time_start = rq_clock_task(rq);
+
 	avg_vruntime_add(cfs_rq, se);
 	se->min_vruntime = se->vruntime;
 	se->min_slice = se->slice;
@@ -5322,7 +5326,6 @@ static void
 enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
 	bool curr = cfs_rq->curr == se;
-  struct rq *rq = rq_of(cfs_rq);
 
 	/*
 	 * If we're the current task, we must renormalise before calling
@@ -5366,21 +5369,6 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	check_schedstat_required();
 	update_stats_enqueue_fair(cfs_rq, se, flags);
-
-  if (!curr && !se->rl_wait_time_start)
-    se->rl_wait_time_start = rq_clock_task(rq);
-
-  if (unlikely(!se->rl_inited)) {
-    se->rl_action = rl_policy_decide(0, 0);   /* first decision on zeros */
-
-    se->rl_sum_at_start    = se->sum_exec_runtime;
-    se->rl_last_wait_time  = 0;
-    se->rl_burst           = 0;
-    se->rl_wait_time_start = 0;
-    se->rl_inited          = 1;
-}
-
-
 	if (!curr)
 		__enqueue_entity(cfs_rq, se);
 	se->on_rq = 1;
@@ -5398,7 +5386,6 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 			if (!cfs_rq->throttled_clock_self)
 				cfs_rq->throttled_clock_self = rq_clock(rq);
 #endif
-    
 		}
 	}
 }
@@ -5517,8 +5504,6 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	update_load_avg(cfs_rq, se, action);
 	se_update_runnable(se);
 
-  se->rl_wait_time_start = 0;
-
 	update_stats_dequeue_fair(cfs_rq, se, flags);
 
 	update_entity_lag(cfs_rq, se);
@@ -5560,7 +5545,7 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	clear_buddies(cfs_rq, se);
 
-	 
+	/* 'current' is not kept within the tree. */
 	if (se->on_rq) {
 		/*
 		 * Any task has to be enqueued before it get to execute on
@@ -5572,17 +5557,9 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 		update_load_avg(cfs_rq, se, UPDATE_TG);
 
 		set_protect_slice(se);
-if (se->rl_wait_time_start) {
-    struct rq *rq = rq_of(cfs_rq);
-    u64 now = rq_clock_task(rq);
-    u64 wait_ns = now - se->rl_wait_time_start;
-
-    se->rl_wait_time_start = 0;
-    se->rl_last_wait_time = wait_ns;
-  }
-
 	}
-  	update_stats_curr_start(cfs_rq, se);
+
+	update_stats_curr_start(cfs_rq, se);
 	WARN_ON_ONCE(cfs_rq->curr);
 	cfs_rq->curr = se;
 
@@ -5601,7 +5578,6 @@ if (se->rl_wait_time_start) {
 				    se->sum_exec_runtime - se->prev_sum_exec_runtime));
 	}
 
-  se->rl_sum_at_start = se->sum_exec_runtime;
 	se->prev_sum_exec_runtime = se->sum_exec_runtime;
 }
 
@@ -5642,34 +5618,6 @@ pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq)
 
 static bool check_cfs_rq_runtime(struct cfs_rq *cfs_rq);
 
-static inline void apply_action_nice(struct cfs_rq *cfs_rq,
-                                     struct sched_entity *se,
-                                     int new_nice)
-{
-    struct task_struct *p = task_of(se);
-
-    if (unlikely(p->sched_class != &fair_sched_class))
-        return; /* ignore non-CFS */
-
-    new_nice = clamp(new_nice, MIN_NICE, MAX_NICE);
-    if (task_nice(p) == new_nice)
-        return; 
-
-    /* 1) Update prio fields for this CFS task */
-    p->static_prio = NICE_TO_PRIO(new_nice);
-    p->prio        = p->static_prio;   /* ok for SCHED_NORMAL */
-
-    /*
-     * 2) Recompute se->load.weight (uclamp-aware) WITHOUT touching rq totals.
-     *    Then apply it to the cfs_rq with reweight_entity().
-     */
-    set_load_weight(p, false);                 /* updates se->load.weight */
-    reweight_entity(cfs_rq, se, se->load.weight);
-
-    /* 3) EEVDF: refresh deadline so placement/reinsert uses new params */
-    update_deadline(cfs_rq, se);
-}
-
 static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
 {
 	/*
@@ -5679,27 +5627,22 @@ static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
 	if (prev->on_rq)
 		update_curr(cfs_rq);
 
+  u64 burst_time = prev->sum_exec_runtime - prev->prev_sum_exec_runtime;
+  prev->rl_last_burst_time = burst_time;
+  prev->rl_burst_count++;
+  cfs_rq->total_burst_time += burst_time;
+  cfs_rq->burst_count++;
+
 	/* throttle cfs_rqs exceeding runtime */
 	check_cfs_rq_runtime(cfs_rq);
 
-	  rl_policy_reward(prev->rl_burst,prev->rl_last_wait_time,prev->rl_action, prev->rl_last_wait_time, prev->rl_burst,prev->vruntime);
-  prev->rl_action = rl_policy_decide(prev->rl_burst,prev->rl_last_wait_time);
-  apply_action_nice(cfs_rq, prev, prev->rl_action);
-
-
 	if (prev->on_rq) {
-    if(!prev->rl_wait_time_start){
-		  struct rq *rq = rq_of(cfs_rq);
-		  prev->rl_wait_time_start = rq_clock_task(rq);
-	  } 
 		update_stats_wait_start_fair(cfs_rq, prev);
 		/* Put 'current' back into the tree. */
 		__enqueue_entity(cfs_rq, prev);
 		/* in !on_rq case, update occurred at dequeue */
 		update_load_avg(cfs_rq, prev, 0);
-	} else {
-    prev->rl_wait_time_start = 0;
-  }
+	}
 	WARN_ON_ONCE(cfs_rq->curr != prev);
 	cfs_rq->curr = NULL;
 }
@@ -6992,16 +6935,6 @@ requeue_delayed_entity(struct sched_entity *se)
 	update_load_avg(cfs_rq, se, 0);
 	clear_delayed(se);
 }
-static inline q16_16 q_from_ns_clamped(s64 ns)
-{
-    /* Convert ns -> us to keep magnitudes in a comfy range */
-    s64 us = div_s64(ns, 1000);
-    /* Clamp to Q16.16 signed 32-bit range: [-32768, 32767] in integer part */
-    if (us >  0x7fff) us =  0x7fff;
-    if (us < -0x8000) us = -0x8000;
-    return (q16_16)(us << 16);  /* to Q16.16 */
-
-}
 
 /*
  * The enqueue_task method is called before nr_running is
@@ -7043,7 +6976,6 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 	if (task_new && se->sched_delayed)
 		h_nr_runnable = 0;
-
 
 	for_each_sched_entity(se) {
 		if (se->on_rq) {
@@ -9080,17 +9012,11 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev, struct t
 {
 	struct sched_entity *se = &prev->se;
 	struct cfs_rq *cfs_rq;
-  
-  if (likely(prev->se.rl_sum_at_start)) {
-        u64 burst = prev->se.sum_exec_runtime - prev->se.rl_sum_at_start;
-        se->rl_burst = burst;
-  }
 
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 		put_prev_entity(cfs_rq, se);
 	}
-  
 }
 
 /*
@@ -12260,8 +12186,14 @@ static inline bool update_newidle_cost(struct sched_domain *sd, u64 cost)
 		/*
 		 * Track max cost of a domain to make sure to not delay the
 		 * next wakeup on the CPU.
+		 *
+		 * sched_balance_newidle() bumps the cost whenever newidle
+		 * balance fails, and we don't want things to grow out of
+		 * control.  Use the sysctl_sched_migration_cost as the upper
+		 * limit, plus a litle extra to avoid off by ones.
 		 */
-		sd->max_newidle_lb_cost = cost;
+		sd->max_newidle_lb_cost =
+			min(cost, sysctl_sched_migration_cost + 200);
 		sd->last_decay_max_lb_cost = jiffies;
 	} else if (time_after(jiffies, sd->last_decay_max_lb_cost + HZ)) {
 		/*
@@ -12953,10 +12885,17 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
 
 			t1 = sched_clock_cpu(this_cpu);
 			domain_cost = t1 - t0;
-			update_newidle_cost(sd, domain_cost);
-
 			curr_cost += domain_cost;
 			t0 = t1;
+
+			/*
+			 * Failing newidle means it is not effective;
+			 * bump the cost so we end up doing less of it.
+			 */
+			if (!pulled_task)
+				domain_cost = (3 * sd->max_newidle_lb_cost) / 2;
+
+			update_newidle_cost(sd, domain_cost);
 		}
 
 		/*
@@ -13362,10 +13301,104 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
 	}
 }
 
+#define NS_PER_10MS 10000000ULL
+
+static inline q16_16 q_from_ratio_u64(u64 num, u64 den) {
+    if (!den) return 0;
+    u64 q = div64_u64(num << Q, den);
+    if (q > 0x7fffffffULL) q = 0x7fffffffULL;
+    return (q16_16)q;
+}
+
+/* ns → Q16.16 normalized by ns_scale (e.g., 10ms) */
+static inline q16_16 q_from_ns(u64 ns, u64 ns_scale) {
+    return q_from_ratio_u64(ns, ns_scale ? ns_scale : 1);
+}
+
+/* avg = total / count (u64), then ns->Q16.16 with a scale */
+static inline q16_16 q_from_avg_ns(u64 total_ns, u64 count, u64 ns_scale)
+{
+	if (!count) return 0;
+	return q_from_ns(div64_u64(total_ns, count), ns_scale);
+}
+
+static inline q16_16 q_from_vruntime_lag(const struct cfs_rq *cfs_rq,
+                                         const struct sched_entity *se,
+                                         u64 ns_scale)
+{
+	u64 base = cfs_rq->min_vruntime;
+	u64 lag  = (se->vruntime > base) ? (se->vruntime - base) : 0;
+	return q_from_ns(lag, ns_scale);
+}
+
+/* declare your NN interface (defined in your NN .c) */
+q16_16 nn_output[11];
+
 static void __set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
 {
 	struct sched_entity *se = &p->se;
+  struct cfs_rq* cfs_rq = cfs_rq_of(se);
 
+  {
+		u64 now = rq_clock_task(rq);
+		if (se->rl_wait_time_start) {
+			u64 rl_wait_time = now - se->rl_wait_time_start;
+
+			se->rl_last_wait_time  = rl_wait_time;
+			se->rl_total_wait_time += rl_wait_time;
+			se->rl_wait_time_count++;
+			se->rl_wait_time_start = 0;
+
+			/* if you maintain these on cfs_rq */
+			cfs_rq->total_wait_time += rl_wait_time;
+			cfs_rq->wait_count++;
+
+			/* ----- Build NN input (Q16.16) ----- */
+			const u64 ns_scale = NS_PER_10MS;
+			q16_16 in[8];
+
+			/* 0: this task's last wait */
+			in[0] = q_from_ns(se->rl_last_wait_time, ns_scale);
+
+			/* 1: this task's avg wait */
+			in[1] = q_from_avg_ns(se->rl_total_wait_time, se->rl_wait_time_count, ns_scale);
+
+			/* 2: this task's last burst (from previous switch-out) */
+			in[2] = q_from_ns(se->rl_last_burst_time, ns_scale);
+
+			/* 3: this task's avg burst = sum_exec_runtime / burst_count */
+			in[3] = q_from_avg_ns(se->sum_exec_runtime, se->rl_burst_count, ns_scale);
+
+			/* 4: vruntime lag vs min_vruntime (better than raw vruntime) */
+			in[4] = q_from_vruntime_lag(cfs_rq, se, ns_scale);
+
+			/* 5: lifetime exec time */
+			in[5] = q_from_ns(se->sum_exec_runtime, ns_scale);
+
+			/* 6: cfs_rq avg burst */
+			in[6] = q_from_avg_ns(cfs_rq->total_burst_time, cfs_rq->burst_count, ns_scale);
+
+			/* 7: cfs_rq avg wait */
+			in[7] = q_from_avg_ns(cfs_rq->total_wait_time, cfs_rq->wait_count, ns_scale);
+
+			/* ----- Run policy and map to action ----- */
+			forward_prop(in); /* fills nn_output[0..10] (Q16.16 softmax) */
+
+			/* Example: argmax -> nice delta in {-5..+5} */
+			static const int nice_delta[11] = {-5,-4,-3,-2,-1,0,1,2,3,4,5};
+			int best = 0;
+			q16_16 bestp = nn_output[0];
+			for (int i = 1; i < 11; i++)
+				if (nn_output[i] > bestp) { bestp = nn_output[i]; best = i; }
+
+			long new_nice = clamp_val(task_nice(p) + nice_delta[best], -20, 19);
+      trace_printk("New Nice: %ld",new_nice);
+			if (new_nice != task_nice(p))
+				set_user_nice(p, new_nice);
+		} else {
+			se->rl_last_wait_time = 0;
+		}
+	}
 #ifdef CONFIG_SMP
 	if (task_on_rq_queued(p)) {
 		/*
@@ -13410,6 +13443,10 @@ static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
 
 void init_cfs_rq(struct cfs_rq *cfs_rq)
 {
+  cfs_rq->total_wait_time = 0;
+  cfs_rq->wait_count = 0;
+  cfs_rq->total_burst_time = 0;
+  cfs_rq->burst_count = 0;
 	cfs_rq->tasks_timeline = RB_ROOT_CACHED;
 	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
 #ifdef CONFIG_SMP

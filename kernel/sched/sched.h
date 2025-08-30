@@ -652,6 +652,11 @@ struct cfs_rq {
 	s64			avg_vruntime;
 	u64			avg_load;
 
+  u64 total_wait_time;
+  u64 wait_count;
+  u64 total_burst_time;
+  u64 burst_count;
+
 	u64			min_vruntime;
 #ifdef CONFIG_SCHED_CORE
 	unsigned int		forceidle_seq;

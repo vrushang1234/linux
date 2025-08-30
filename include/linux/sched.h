@@ -587,14 +587,13 @@ struct sched_entity {
 	s64				vlag;
 	u64				slice;
 
-  u64 rl_sum_at_start;
-  u64 rl_burst;
   u64 rl_wait_time_start;
-  u64 rl_wait_time_end;
   u64 rl_last_wait_time;
-  int rl_action;
-  int rl_inited;
-  
+  u64 rl_total_wait_time;
+  u64 rl_wait_time_count;
+
+  u64 rl_last_burst_time;
+  u64 rl_burst_count;
 
 	u64				nr_migrations;
 
